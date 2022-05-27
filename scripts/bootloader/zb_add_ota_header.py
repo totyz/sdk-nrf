@@ -7,31 +7,37 @@
 import argparse
 import os
 import struct
+from typing import List, NamedTuple
 
-OTA_HEADER_FILE_ID               = 0x0BEEF11E
-OTA_HEADER_VERSION               = 0x0100
-OTA_HEADER_LENGTH                = 4 + 2 + 2 + 2 + 2 + 2 + 4 + 2 + 32 + 4
-OTA_HEADER_FIELD_CONTROL         = 0x00
+OTA_HEADER_FILE_ID = 0x0BEEF11E
+OTA_HEADER_VERSION = 0x0100
+OTA_HEADER_LENGTH = 4 + 2 + 2 + 2 + 2 + 2 + 4 + 2 + 32 + 4
+OTA_HEADER_FIELD_CONTROL = 0x00
 OTA_HEADER_MANUFACTURER_WILDCARD = 0xFFFF
-OTA_HEADER_IMAGE_TYPE_WILDCARD   = 0xFFFF
-OTA_HEADER_STACK_VER_ZIGBEE_PRO  = 0x0002
+OTA_HEADER_IMAGE_TYPE_WILDCARD = 0xFFFF
+OTA_HEADER_STACK_VER_ZIGBEE_PRO = 0x0002
 
 OTA_HEADER_FIELD_CONTROL_BIT_MASK_HW_VER = (1 << 2)
-OTA_HEADER_MIN_HW_VERSION_LENGTH         = 2
-OTA_HEADER_MAX_HW_VERSION_LENGTH         = 2
+OTA_HEADER_MIN_HW_VERSION_LENGTH = 2
+OTA_HEADER_MAX_HW_VERSION_LENGTH = 2
 
 OTA_SUBELEMENT_TYPE_IMAGE = 0x0000
 OTA_SUBELEMENT_HEADER_LENGTH = 6
+
+
+class Firmware(NamedTuple):
+    fw_type: int
+    fw: bytes
+
 
 class OTA_file:
 
     def __init__(self,
                  file_version,
-                 firmware_len,
-                 firmware,
-                 manufacturer_code = OTA_HEADER_MANUFACTURER_WILDCARD,
-                 image_type = OTA_HEADER_IMAGE_TYPE_WILDCARD,
-                 comment = '',
+                 files: List[List],
+                 manufacturer_code=OTA_HEADER_MANUFACTURER_WILDCARD,
+                 image_type=OTA_HEADER_IMAGE_TYPE_WILDCARD,
+                 comment='',
                  min_hw_version=None,
                  max_hw_version=None,
                  legacy_format=False):
@@ -39,11 +45,21 @@ class OTA_file:
            see: https://zigbeealliance.org/wp-content/uploads/2019/12/07-5123-06-zigbee-cluster-library-specification.pdf
            (access verified as of 2020-07-16)
         '''
+        firmwares: List[Firmware] = []
+        for file in files:
+            if len(file) == 1:
+                with open(file[0], 'rb') as f:
+                    firmware = Firmware(OTA_SUBELEMENT_TYPE_IMAGE, bytes(f.read()))
+            else:
+                with open(file[1], 'rb') as f:
+                    firmware = Firmware(hex2int(file[0]), bytes(f.read()))
+            firmwares.append(firmware)
 
-        if legacy_format is True:
-            total_len = OTA_HEADER_LENGTH + firmware_len
-        else:
-            total_len = OTA_HEADER_LENGTH + OTA_SUBELEMENT_HEADER_LENGTH + firmware_len
+        total_len = OTA_HEADER_LENGTH + len(firmwares[0].fw) + \
+                    (sum(len(f.fw) for f in firmwares) if not legacy_format else 0)
+
+        ota_firmwares = []
+        [ota_firmwares.append(OTA_subelement(firmware)) for firmware in firmwares]
 
         ota_header = OTA_header(OTA_HEADER_FILE_ID,
                                 OTA_HEADER_VERSION,
@@ -58,14 +74,11 @@ class OTA_file:
                                 min_hw_version,
                                 max_hw_version)
 
-        ota_firmware = OTA_subelement(OTA_SUBELEMENT_TYPE_IMAGE,
-                                      firmware_len,
-                                      firmware)
-
         if legacy_format is True:
-            self.binary = ota_header.header + firmware
+            self.binary = ota_header.header + firmwares[0].fw
         else:
-            self.binary = ota_header.header + ota_firmware.encode()
+            self.binary = ota_header.header + b''.join([ota_firmware.encode() for ota_firmware in ota_firmwares])
+
         self.filename = '-'.join(['{:04X}'.format(manufacturer_code),
                                   '{:04X}'.format(image_type),
                                   '{:08X}'.format(file_version),
@@ -73,14 +86,13 @@ class OTA_file:
 
 
 class OTA_subelement:
-    def __init__(self, type_id, length, firmware):
+    def __init__(self, firmware: Firmware):
         self.__pack_format = '<HL'
-        self._type = type_id
-        self._length = length
+        self._length = len(firmware.fw)
         self._fw = firmware
 
-    def encode(self):
-        return struct.pack(self.__pack_format, self._type, self._length) + self._fw
+    def encode(self) -> bytes:
+        return struct.pack(self.__pack_format, self._fw.fw_type, self._length) + self._fw.fw
 
 
 class OTA_header:
@@ -105,7 +117,7 @@ class OTA_header:
         self.__additional_fields = []
 
         # If min and max hardware version are present add optional fields to the header
-        if (isinstance(min_hw_version, int) and isinstance(max_hw_version, int)):
+        if isinstance(min_hw_version, int) and isinstance(max_hw_version, int):
             self.__add_optional_fields((OTA_HEADER_MIN_HW_VERSION_LENGTH + OTA_HEADER_MAX_HW_VERSION_LENGTH),
                                        OTA_HEADER_FIELD_CONTROL_BIT_MASK_HW_VER,
                                        'HH',
@@ -129,37 +141,42 @@ class OTA_header:
         return struct.pack(self.__pack_format, *self.__pack_args)
 
     def __add_optional_fields(self, fields_length, field_control_bit_mask, fields_formatting, fields_values):
-        self.__total_size    += fields_length
+        self.__total_size += fields_length
         self.__header_length += fields_length
         self.__field_control |= field_control_bit_mask
-        self.__pack_format   += fields_formatting
+        self.__pack_format += fields_formatting
         if type(fields_values) in (tuple, list):
             self.__additional_fields.extend(fields_values)
         else:
             self.__additional_fields.append(fields_values)
+
 
 def convert_version_string_to_int(s):
     """Convert from semver string "1.2.3", to integer 1020003"""
     numbers = s.split('.')
     if len(numbers) != 3:
         raise ValueError('application-version-string parameter must be on the format x.y.z')
-    js = [0x100*0x10000, 0x10000, 1]
+    js = [0x100 * 0x10000, 0x10000, 1]
     return sum([js[i] * int(numbers[i]) for i in range(3)])
+
 
 def hex2int(x):
     """Convert hex to int."""
     return int(x, 0)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description='Append Zigbee OTA header to BIN file',
         formatter_class=argparse.RawDescriptionHelpFormatter)
 
-    parser.add_argument('--application', required=True,
+    parser.add_argument('--application', required=True, action="append", nargs='*',
                         help='The application firmware file.')
     parser.add_argument('--application-version-string', required=True,
-                        help="The application version string, e.g. '2.7.31'. Will be converted to an integer, e.g. 20731.")
-    parser.add_argument('--zigbee-manufacturer-id', required=False, default=OTA_HEADER_MANUFACTURER_WILDCARD, type=hex2int,
+                        help="The application version string, e.g. '2.7.31'. Will be converted to an integer, "
+                             "e.g. 20731.")
+    parser.add_argument('--zigbee-manufacturer-id', required=False, default=OTA_HEADER_MANUFACTURER_WILDCARD,
+                        type=hex2int,
                         help='Manufacturer ID to be used in Zigbee OTA header.')
     parser.add_argument('--zigbee-image-type', required=False, default=OTA_HEADER_IMAGE_TYPE_WILDCARD, type=hex2int,
                         help='Image type to be used in Zigbee OTA header.')
@@ -179,14 +196,14 @@ def parse_args():
 def main():
     args = parse_args()
 
-    app_file = args.application
+    app_files = args.application
     app_version_int = convert_version_string_to_int(args.application_version_string)
     zb_manufacturer_id = args.zigbee_manufacturer_id
     zb_image_type = args.zigbee_image_type
     zb_comment = args.zigbee_comment
     out_dir = args.out_directory
 
-    if any(ord(char) > 127 for char in zb_comment): # Check if all the characters belong to the ASCII range
+    if any(ord(char) > 127 for char in zb_comment):  # Check if all the characters belong to the ASCII range
         print('Warning: Non-ASCII characters in the comment are not allowed. Discarding comment.')
         zb_comment = ''
     elif len(zb_comment) > 30:
@@ -211,18 +228,14 @@ def main():
         if zb_ota_min_hw_version > zb_ota_max_hw_version:
             raise ValueError('Warning: zigbee-ota-min-hw-version is higher than zigbee-ota-max-hw-version.')
 
-    with open(app_file, 'rb') as file:
-        bin_file = file.read()
-
     zigbee_ota_file = OTA_file(app_version_int,
-                                os.path.getsize(app_file),
-                                bytes(bin_file),
-                                zb_manufacturer_id,
-                                zb_image_type,
-                                zb_comment,
-                                zb_ota_min_hw_version,
-                                zb_ota_max_hw_version,
-                                args.legacy)
+                               app_files,
+                               zb_manufacturer_id,
+                               zb_image_type,
+                               zb_comment,
+                               zb_ota_min_hw_version,
+                               zb_ota_max_hw_version,
+                               args.legacy)
 
     with open(os.path.join(out_dir, zigbee_ota_file.filename), 'wb') as f:
         f.write(zigbee_ota_file.binary)
